@@ -1,27 +1,39 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
-from typing import List
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
+import os
+import requests
 
 from database import get_db, User, init_db
-from auth import verify_password,hash_password
-from ai_engine import generate_content
+from auth import verify_password, hash_password
 
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from auth_utils import decode_token
-from auth_utils import create_access_token
-from fastapi.staticfiles import StaticFiles
+# ======================
+# CONFIG
+# ======================
 
-security = HTTPBearer()
+SECRET_KEY = os.getenv("SECRET_KEY", "supersecretkey")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+HF_TOKEN = os.getenv("HF_TOKEN")
+HF_API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2"
+
+headers = {
+    "Authorization": f"Bearer {HF_TOKEN}"
+}
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 # ======================
 # INIT
 # ======================
 
 init_db()
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-
 app = FastAPI()
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -30,11 +42,10 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 def serve_frontend():
     return FileResponse("static/index.html")
 
-
-
 # ======================
 # SCHEMAS
 # ======================
+
 class UserCreate(BaseModel):
     email: str
     password: str
@@ -45,53 +56,61 @@ class UserLogin(BaseModel):
 
 class RepurposeRequest(BaseModel):
     content: str
-    
+
+# ======================
+# JWT FUNCTIONS
+# ======================
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid authentication"
+    )
+
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+
+    user = db.query(User).filter(User.email == email).first()
+
+    if user is None:
+        raise credentials_exception
+
+    return user
+
 # ======================
 # SIGNUP
 # ======================
 
-from fastapi import Depends, HTTPException
-from sqlalchemy.orm import Session
-from pydantic import BaseModel
-
-from database import get_db, User
-from auth import hash_password
-
-
-class UserCreate(BaseModel):
-    email: str
-    password: str
-
-
 @app.post("/signup")
 def signup(user: UserCreate, db: Session = Depends(get_db)):
-    # 1. Check if email already exists
+
     existing_user = db.query(User).filter(User.email == user.email).first()
     if existing_user:
         raise HTTPException(status_code=400, detail="Email already registered")
 
-    # 2. Hash password (IMPORTANT FIX)
-    hashed_password = hash_password(user.password)
-
-    # 3. Create user
     new_user = User(
         email=user.email,
-        password_hash=hashed_password,
+        password_hash=hash_password(user.password),
         plan="free",
         usage_count=0,
         is_active=True
     )
 
-    # 4. Save to database
     db.add(new_user)
     db.commit()
-    db.refresh(new_user)
 
-    return {
-        "message": "Signup successful",
-        "email": new_user.email,
-        "plan": new_user.plan
-    }
+    return {"message": "Signup successful"}
 
 # ======================
 # LOGIN
@@ -99,80 +118,87 @@ def signup(user: UserCreate, db: Session = Depends(get_db)):
 
 @app.post("/login")
 def login(user: UserLogin, db: Session = Depends(get_db)):
+
     db_user = db.query(User).filter(User.email == user.email).first()
 
-    if not db_user:
+    if not db_user or not verify_password(user.password, db_user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    if not verify_password(user.password, db_user.password_hash):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-
-    # ✅ CREATE TOKEN
-    access_token = create_access_token(
-        data={"sub": db_user.email}
-    )
+    access_token = create_access_token({"sub": db_user.email})
 
     return {
         "access_token": access_token,
         "token_type": "bearer"
     }
 
+# ======================
+# HUGGINGFACE AI FUNCTION
+# ======================
+
+def generate_with_hf(prompt: str):
+
+    payload = {
+        "inputs": prompt,
+        "parameters": {
+            "max_new_tokens": 200
+        }
+    }
+
+    response = requests.post(HF_API_URL, headers=headers, json=payload)
+
+    if response.status_code != 200:
+        raise HTTPException(status_code=500, detail="HF API Error")
+
+    result = response.json()
+
+    return result[0]["generated_text"]
+
+# ======================
+# REPURPOSE
+# ======================
+
 @app.post("/repurpose")
 def repurpose(
     data: RepurposeRequest,
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    # 1. Decode token
-    payload = decode_token(credentials.credentials)
-    if not payload:
-        raise HTTPException(status_code=401, detail="Invalid token")
 
-    email = payload.get("sub")
-
-    # 2. Get user from DB
-    db_user = db.query(User).filter(User.email == email).first()
-    if not db_user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    # 3. Usage limit (FREE = 3)
-    if db_user.plan == "free" and db_user.usage_count >= 3:
+    # Free plan limit
+    if current_user.plan == "free" and current_user.usage_count >= 3:
         raise HTTPException(
-        status_code=403,
-        detail="Free plan limit reached. Upgrade to Pro."
-    )
+            status_code=403,
+            detail="Free plan limit reached. Upgrade to Pro."
+        )
 
-    # 4. Increase usage
-    if db_user.plan == "free":
-       db_user.usage_count += 1
+    prompt = f"""
+You are a professional content repurposing assistant.
+Rewrite the following content professionally:
 
-    db.commit()
+{data.content}
+"""
 
-    # 5. Generate content
-    result = generate_content(
-    text=data.content,
-    targets=["twitter"]
-)
+    ai_output = generate_with_hf(prompt)
 
+    # Increase usage
+    if current_user.plan == "free":
+        current_user.usage_count += 1
+        db.commit()
 
     return {
-        "usage": db_user.usage_count,
-        "result": result
+        "usage": current_user.usage_count,
+        "result": ai_output
     }
 
+# ======================
+# UPGRADE
+# ======================
+
 @app.post("/upgrade")
-def upgrade_to_pro(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-    db: Session = Depends(get_db)
-):
-    payload = decode_token(credentials.credentials)
-    email = payload.get("sub")
+def upgrade(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
 
-    user = db.query(User).filter(User.email == email).first()
-
-    user.plan = "pro"          # 🔥 THIS WAS MISSING
-    user.usage_count = 0       # reset usage
-
+    current_user.plan = "pro"
+    current_user.usage_count = 0
     db.commit()
 
     return {"message": "Upgraded to Pro successfully"}
@@ -180,8 +206,7 @@ def upgrade_to_pro(
 # ======================
 # HEALTH
 # ======================
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
-
