@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AI Repurpose SaaS</title>
+</head>
+<body>
+
+<h2>Login</h2>
+<input id="email" placeholder="Email">
+<input id="password" type="password" placeholder="Password">
+<button onclick="login()">Login</button>
+
+<hr>
+
+<h2>Repurpose</h2>
+<textarea id="text" placeholder="Enter text"></textarea><br>
+<button onclick="repurpose()">Repurpose</button>
+
+<pre id="output"></pre>
+
+<script>
+  let token = localStorage.getItem("token") || "";
+  
+  async function login() {
+      const res = await fetch("/login", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+              email: document.getElementById("email").value,
+              password: document.getElementById("password").value
+          })
+      });
+  
+      const data = await res.json();
+  
+      if (data.access_token) {
+          token = data.access_token;
+          localStorage.setItem("token", token);
+          alert("Login successful");
+      } else {
+          alert(data.detail || "Login failed");
+      }
+  }
+  
+  async function repurpose() {
+      if (!token) {
+          alert("Please login first");
+          return;
+      }
+  
+      const res = await fetch("/repurpose", {
+          method: "POST",
+          headers: {
+              "Content-Type": "application/json",
+              "Authorization": "Bearer " + token
+          },
+          body: JSON.stringify({
+              text: document.getElementById("text").value,
+              targets: ["twitter", "linkedin"]
+          })
+      });
+  
+      const data = await res.json();
+      document.getElementById("output").innerText =
+          JSON.stringify(data, null, 2);
+  }
+  </script>
+  
+</body>
+</html>
+
